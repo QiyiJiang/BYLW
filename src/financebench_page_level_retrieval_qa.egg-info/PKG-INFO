@@ -1,0 +1,340 @@
+Metadata-Version: 2.4
+Name: financebench-page-level-retrieval-qa
+Version: 0.1.0
+Summary: FinanceBench open-source 150 page-level retrieval + Qwen QA experiments (BM25, BGE, ColPali).
+Author-email: Researcher <example@example.com>
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: tqdm>=4.65.0
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: rank-bm25>=0.2.2
+Requires-Dist: pymupdf>=1.24.0
+Requires-Dist: pdfplumber>=0.11.0
+Requires-Dist: pytesseract>=0.3.10
+Requires-Dist: Pillow>=10.0.0
+Requires-Dist: pyarrow>=14.0.0
+Requires-Dist: matplotlib>=3.8.0
+Provides-Extra: dev
+Requires-Dist: black; extra == "dev"
+Requires-Dist: isort; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+
+# FinanceBench Page-level Retrieval + Qwen QA
+
+本项目实现基于 FinanceBench open-source 150 的**页级证据检索 + 基于证据回答生成**完整离线实验流程，统一调用在线 API 实现 BGE/ColPali/Qwen 能力，并比较 BM25、BGE、ColPali 三种检索方法在页级证据检索与问答上的表现。
+
+整条主线对应论文中的实验设置：
+
+> 问题输入 → 页级检索（BM25/BGE/ColPali）→ 取 Top-k 证据页 → 调用 Qwen2.5-7B-Instruct 回答 → 评测检索质量与回答质量
+
+---
+
+## 环境准备与运行方式
+
+- **Python 版本**：推荐 Python 3.10+。
+- **环境管理**：默认使用 `uv` 管理依赖和运行脚本。
+
+- **安装依赖**（在项目根目录执行）：
+
+```bash
+uv sync
+```
+
+- **运行脚本方式**：统一使用 `uv run`，例如：
+
+```bash
+uv run python scripts/01_prepare_data.py
+```
+
+---
+
+## 目录结构（核心）
+
+- `config/`
+  - **`paths.yaml`**：数据与结果路径配置（原始 JSONL、PDF、processed 表、cache 缓存、results 输出、Milvus Lite DB 路径等）。
+  - **`api.yaml`**：在线模型 API 配置（BGE / Qwen 的 base_url、model 名称、环境变量名等）。
+  - **`experiment.yaml`**：统一实验配置（Top-k、上下文 token 限制、温度、消融设置、后端选择等）。
+- `data/`
+  - **`raw/`**：官方 FinanceBench JSONL 与 `/pdfs/`。
+    - `financebench_open_source.jsonl`
+    - `financebench_document_information.jsonl`
+    - `pdfs/`（官方提供的 PDF 文档目录）
+  - **`processed/`**：标准化后的中间表。
+    - `questions.parquet`：问题表（question、answer、evidence、question_type 等）。
+    - `pages.parquet`：页面表（page_uid、doc_name、page_id、page_image_path、page_text）。
+    - `gold_pages.parquet`：gold 证据页映射（每个问题对应 gold page_uids）。
+  - **`cache/`**：少量中间缓存（例如 ColPali 预编码临时张量），主向量索引存入 Milvus Lite，而不是长期保存在本地数组文件。
+- `src/fbbench/`
+  - `data_loading.py`：FinanceBench JSONL 读取与问题表构建。
+  - `page_building.py`：PDF → 页图像 + 页文本抽取。
+  - `gold_mapping.py`：根据 evidence 字段构建 gold 证据页映射。
+  - `api_clients/`：在线 BGE / Qwen API 客户端。
+  - `index/milvus_client.py`：Milvus Lite 客户端与 `MilvusIndex` 抽象（统一管理向量 collection）。
+  - `retrievers/`：BM25 / BGE / ColPali 三种页级检索器（BGE/ColPali 基于 Milvus Lite 向量索引，BM25 仍用本地 `rank-bm25`）。
+  - `qa/`：固定提示模板与问答流水线（Qwen2.5-7B-Instruct）。
+  - `eval/`：检索与问答指标计算（Recall@k / MRR / Accuracy / SupportedAccuracy）。
+  - `analysis/`：典型案例筛选与流程图/可视化脚本。
+- `scripts/`：一步步跑完所有实验的命令行脚本（见下文“完整运行步骤”）。
+- `results/`
+  - `retrieval/`：表 5-1 相关的检索 raw 结果与汇总表。
+  - `qa/`：表 5-2 / 5-3 / 5-4 的问答输出与汇总表。
+  - `figures/`：图 5-1 / 5-2 等可视化文件。
+  - `annotations/`：人工标注文件（回答正确性与证据支持情况）。
+  - `analysis/`：典型案例 Markdown 文档，方便写论文直接引用。
+
+详细模块设计与实验流程也记录在 `.cursor/plans/financebench-page-level-retrieval-qa_b1e57c9c.plan.md` 中。
+
+---
+
+## 在线 API 配置说明
+
+本项目在“生成端 + 文本向量”上通过在线 API 调用，在“视觉页向量 + 索引存储”上使用本地部署：
+
+- **BGE-base-en-v1.5**（硅基流动 `/v1/embeddings`）：文本 embedding，用于页文本稠密检索（写入 Milvus Lite `pages_bge` collection）。
+- **ColQwen2.5 (ColPali)**（本地 transformers + `colpali-engine`）：页面图像 embedding，用于视觉页检索（写入 Milvus Lite `pages_colpali` collection）。
+- **Qwen/Qwen3-32B**（硅基流动 `/v1/chat/completions`）：长上下文问答模型，用于根据 Top-k 页文本生成答案。
+
+你需要根据自己的服务环境配置好在线 API 与本地 Milvus Lite 路径：
+
+- 在 shell 中导出若干环境变量（示例）：
+
+```bash
+export EMBEDDING_API_KEY="YOUR_SILICONFLOW_EMBEDDING_KEY"
+export SILICONFLOW_LLM_API_KEY="YOUR_SILICONFLOW_LLM_KEY"
+```
+
+- 修改 `config/api.yaml` 里的字段，使之对应你的在线服务：
+  - **`embedding`**：BGE 的 `base_url`、`model`、`api_key_env`（已默认指向硅基流动 `/v1/embeddings`）。
+  - **`llm`**：Qwen/Qwen3-32B 的 `base_url`、`model`、`api_key_env`（已默认指向硅基流动 `/v1/chat/completions`）。
+- 在 `config/paths.yaml` 中确认 `milvus.db_path` 指向你希望存放 Milvus Lite 本地文件的位置（默认 `data/milvus/db`）。
+
+客户端默认假设（兼容 OpenAI 风格）：
+
+- BGE：提供兼容 `/v1/embeddings` 的接口（硅基流动已满足）。
+- Qwen：提供兼容 `/v1/chat/completions` 的接口（硅基流动已满足）。
+- ColPali：完全本地部署，通过 `colpali-engine` + Hugging Face 模型实现，不再使用远程 API。
+
+如果你的接口字段略有差异，可以在 `src/fbbench/api_clients/*.py` 中做小改动。
+
+---
+
+## 完整运行步骤（一步步得到所有表和图）
+
+下面假设你已经：
+
+- 把 FinanceBench 官方 JSONL 和 `/pdfs/` 放到 `data/raw/` 目录；
+- 配好 `config/api.yaml` 并设置好环境变量；
+- 在项目根目录执行过 `uv sync`。
+
+### 第 1 步：构建问题表（questions）
+
+- **脚本**：`scripts/01_prepare_data.py`
+- **作用**：
+  - 读取官方的 `financebench_open_source.jsonl` 与 `financebench_document_information.jsonl`；
+  - 按官方 README 的 join 规则，构建问题级表：
+    - `financebench_id`, `question`, `answer`, `evidence`,
+      `question_type`, `question_reasoning`, `company`, `doc_name` 等。
+  - 输出到 `data/processed/questions.parquet`。
+- **命令**：
+
+```bash
+uv run python scripts/01_prepare_data.py
+```
+
+### 第 2 步：构建页面库（pages）
+
+- **脚本**：`scripts/02_build_pages.py`
+- **作用**：
+  - 遍历 `data/raw/pdfs/` 中所有 PDF；
+  - 用 `PyMuPDF` 将每页渲染为图像（默认 150 DPI），保存到：
+    - `data/processed/page_images/{doc_name}/{page_id}.png`
+  - 优先用 `pdfplumber`/`PyMuPDF` 抽取每页文本；若文本过短/为空，再用 `pytesseract` 对该页图像做 OCR 兜底；
+  - 生成统一页面表 `pages.parquet`，包含：
+    - `page_uid = {doc_name}_{page_id}`（0-index，与 evidence_page_num 对齐）
+    - `doc_name`, `page_id`, `page_image_path`, `page_text`。
+- **命令**：
+
+```bash
+uv run python scripts/02_build_pages.py
+```
+
+如需调整 DPI、OCR 语言等，可以在命令行加参数，例如：
+
+```bash
+uv run python scripts/02_build_pages.py --dpi 144 --ocr-lang eng
+```
+
+### 第 3 步：构建 gold 证据页映射（gold_pages）
+
+`gold_pages` 的构建逻辑在 `src/fbbench/gold_mapping.py` 中，主脚本会在检索/QA 阶段自动调用，无需单独手动运行脚本；你也可以在 notebook 里直接 import 使用。
+
+- **作用**：
+  - 遍历 `questions.parquet` 中每个问题的 `evidence` 字段；
+  - 将其中 `(evidence_doc_name, evidence_page_num)` 对映射到 `page_uid`；
+  - 生成 `gold_pages.parquet`，字段包括：
+    - `financebench_id`
+    - `gold_pairs`（原始 doc_name+page_num 对）
+    - `gold_page_uids`（page_uid 集合）。
+
+---
+
+### 第 4 步：预计算向量 / 建立索引（BGE & ColPali）
+
+- **脚本**：`scripts/03_build_indices.py`
+- **作用**：
+  - 读取 `pages.parquet`；
+  - 对每个页面：
+    - 调用 BGE 在线 embedding API，对 `page_text` 编码，得到文本向量；
+    - 调用 ColPali 在线 embedding API，对页面图像编码，得到图像向量；
+  - 将结果缓存到：
+    - `data/cache/bge_page_embeddings.npy`
+    - `data/cache/colpali_page_embeddings.npy`
+- **命令**（默认同时处理 bge/colpali）：
+
+```bash
+uv run python scripts/03_build_indices.py --retrievers bm25 bge colpali
+```
+
+> 说明：BM25 不需要预计算向量，第一次实际检索时会用 `rank-bm25` 在内存中构建索引。
+
+---
+
+### 第 5 步：主检索实验（表 5-1）
+
+- **脚本**：`scripts/04_run_retrieval_experiments.py`
+- **作用**：
+  - 在统一页面库上，比较三种检索器：
+    - BM25（基于 page_text 的传统倒排检索）
+    - BGE 稠密检索（BAAI/bge-base-en-v1.5）
+    - ColPali 页图像检索（基于页面图像 embedding）
+  - 对每个问题，取 Top-k（k ∈ {1,3,5}）检索结果，记录：
+    - `financebench_id`, `method`, `rank`, `page_uid`, `score`, `doc_name`, `page_id`
+  - 结合 `gold_pages` 计算：
+    - Recall@1 / Recall@3 / Recall@5 / MRR；
+  - 输出：
+    - `results/retrieval/{method}_raw_results.parquet`
+    - `results/retrieval/table_5_1.csv`（对应论文表 5-1）。
+- **命令**：
+
+```bash
+uv run python scripts/04_run_retrieval_experiments.py --retrievers bm25 bge colpali --topk_list 1 3 5
+```
+
+---
+
+### 第 6 步：主问答实验（表 5-2）
+
+- **脚本**：`scripts/05_run_qa_experiments.py`
+- **作用**：
+  - 固定回答模型为 **Qwen2.5-7B-Instruct**，比较五种系统：
+    - `qwen_only`：不检索，直接用问题调用 Qwen。
+    - `bm25`：BM25 检索 Top-3 页文本 + Qwen。
+    - `bge`：BGE 稠密检索 Top-3 页文本 + Qwen。
+    - `colpali`：ColPali 页图像检索 Top-3 页文本 + Qwen。
+    - `oracle`：直接把 gold page 的 `page_text` 喂给 Qwen（理论上界）。
+  - 每条记录会保存：
+    - `financebench_id`, `method`, `question`
+    - `pred_answer`（从模型输出中解析出的 Answer 段）
+    - `model_raw_output`（完整模型输出，便于后续检查）
+    - `evidence_pages_used`（实际拼接的 page_uid 列表）
+    - `evidence_pages_text`（模型输出中的 Evidence Pages 段原文）
+  - 输出：
+    - `results/qa/{method}_answers.parquet`
+- **命令**：
+
+```bash
+uv run python scripts/05_run_qa_experiments.py --topk 3
+```
+
+> 之后你需要在 `results/annotations/qa_labels.csv` 中**人工标注**：
+>
+> - 每条 `(financebench_id, method)` 的回答 `label`（correct / incorrect / insufficient / hallucinated）；
+> - `evidence_supported`（该回答引用的证据页面是否在 gold pages 中）。
+>
+> 然后使用 `src/fbbench/eval/qa_metrics.py` 中的 `compute_qa_metrics` 计算：
+> - Accuracy
+> - SupportedAccuracy  
+> 并生成对应的表 5-2。
+
+---
+
+### 第 7 步：Top-k 消融实验（表 5-3）
+
+- **脚本**：`scripts/06_run_ablation_topk.py`
+- **作用**：
+  - 固定检索器为 ColPali，分别使用：
+    - Top-1 / Top-3 / Top-5 证据页 + Qwen；
+  - 为每个 Top-k 单独生成 QA 输出：
+    - `results/qa/colpali_top{k}_answers.parquet`
+  - 后续同样基于人工标注计算 Accuracy / SupportedAccuracy，汇总为表 5-3。
+- **命令**：
+
+```bash
+uv run python scripts/06_run_ablation_topk.py
+```
+
+Top-k 列表由 `config/experiment.yaml` 中的 `ablation.colpali_topk_variants` 控制。
+
+---
+
+### 第 8 步：按问题类型分析（表 5-4）
+
+- **脚本**：`scripts/07_run_typewise_analysis.py`
+- **前提**：
+  - 已完成表 5-1（检索 raw 结果）；
+  - 已完成主问答实验并完成人工标注（`results/annotations/qa_labels.csv`）。
+- **作用**：
+  - 基于 `question_type`（metrics-generated / domain-relevant / novel-generated）：
+    - 分别计算 BGE 与 ColPali 的 Recall@1/3/5、MRR；
+    - 分别计算 BGE+Qwen 与 ColPali+Qwen 的 Accuracy / SupportedAccuracy。
+  - 输出：
+    - `results/qa/table_5_4.csv`（对应论文表 5-4）。
+- **命令**：
+
+```bash
+uv run python scripts/07_run_typewise_analysis.py
+```
+
+---
+
+### 第 9 步：典型案例分析与图表（图 5-1 / 图 5-2）
+
+- **案例筛选脚本**：`scripts/08_select_cases.py`
+  - 结合检索结果与 gold pages，自动筛选：
+    - 案例 A：BM25/BGE 未命中，ColPali 命中；
+    - 案例 B：BM25/BGE 命中但排序靠后，ColPali 更靠前；
+    - 案例 C：检索命中但回答仍出错（可以在代码基础上结合人工标签补充这一类）。
+  - 输出：
+    - `results/analysis/cases_A/B/C.md`，包含问题、各方法 Top-5 检索结果等信息，方便直接在论文中做定性分析。
+  - **命令**：
+
+```bash
+uv run python scripts/08_select_cases.py
+```
+
+- **流程图与可视化脚本**：`fbbench/analysis/plots.py`
+  - 当前实现会将实验主流程的 Mermaid 描述保存到：
+    - `results/figures/figure_5_1_flow.mmd`
+  - 你可以将该 Mermaid 文本直接复制到支持 Mermaid 的工具中生成图 5-1。
+  - **命令**：
+
+```bash
+uv run python -m fbbench.analysis.plots
+```
+
+---
+
+## 总结：从问题到表格与图的映射
+
+- **表 5-1**：`scripts/04_run_retrieval_experiments.py` 自动生成 `results/retrieval/table_5_1.csv`。
+- **表 5-2**：结合 `scripts/05_run_qa_experiments.py` 输出与人工标注，使用 `eval/qa_metrics.py` 统计得到。
+- **表 5-3**：`scripts/06_run_ablation_topk.py` 输出 + 人工标注 + `eval/qa_metrics.py`。
+- **表 5-4**：`scripts/07_run_typewise_analysis.py` 自动生成 `results/qa/table_5_4.csv`。
+- **图 5-1**：`fbbench/analysis/plots.py` 生成的 Mermaid 流程图文本。
+- **图 5-2**：`scripts/08_select_cases.py` 生成的典型案例，可据此手动画 Top-k 排名可视化或表格图。
+
+按本 README 中的顺序一步步执行脚本并补全人工标注，就可以完整复现论文中第五章的所有实验表格与主要图示。
+

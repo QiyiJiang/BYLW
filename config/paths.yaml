@@ -1,0 +1,24 @@
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  cache_dir: "data/cache"
+
+pdf:
+  pdf_dir: "data/raw/pdfs"
+  page_image_dir: "data/processed/page_images"
+
+tables:
+  questions: "data/processed/questions.parquet"
+  pages: "data/processed/pages.parquet"
+  gold_pages: "data/processed/gold_pages.parquet"
+
+results:
+  retrieval_dir: "results/retrieval"
+  qa_dir: "results/qa"
+  figures_dir: "results/figures"
+  annotations_dir: "results/annotations"
+  analysis_dir: "results/analysis"
+
+milvus:
+  db_path: "data/milvus/db.db"
+

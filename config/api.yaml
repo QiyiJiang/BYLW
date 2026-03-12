@@ -1,0 +1,18 @@
+# API 配置：base_url、model、timeout 等从 .env 读取，api_key_env 指定密钥所在环境变量名
+embedding:
+  provider: "siliconflow"
+  base_url: "${EMBEDDING_BASE_URL}"
+  model: "${EMBEDDING_MODEL}"
+  api_key_env: "EMBEDDING_API_KEY"
+  timeout: "${EMBEDDING_TIMEOUT:-30}"
+
+llm:
+  provider: "deepseek"
+  base_url: "${LLM_BASE_URL}"
+  model: "${LLM_MODEL}"
+  api_key_env: "DEEPSEEK_LLM_API_KEY"
+  timeout: "${LLM_TIMEOUT:-60}"
+
+rate_limits:
+  max_requests_per_minute: "${RATE_LIMIT_MAX_REQUESTS_PER_MINUTE:-60}"
+  max_parallel_requests: "${RATE_LIMIT_MAX_PARALLEL_REQUESTS:-4}"
